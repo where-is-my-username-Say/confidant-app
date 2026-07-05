@@ -144,25 +144,43 @@ const API = {
 
   async _sendOpenAI(cfg, system, messages, maxTokens) {
     const url = cfg.baseUrl.replace(/\/+$/, "") + "/chat/completions";
+    const isGemini = /generativelanguage\.googleapis\.com/i.test(cfg.baseUrl);
+
+    const body = {
+      model: cfg.model,
+      max_tokens: maxTokens,
+      temperature: 0.95,
+      messages: [{ role: "system", content: system }, ...messages.map((m) => ({ role: m.role, content: m.content }))]
+    };
+
+    // Gemini's "thinking" models spend part of max_tokens on invisible
+    // reasoning before writing a reply, which can leave nothing for the
+    // actual answer on small token budgets. Turning reasoning off keeps
+    // the whole budget available for visible output.
+    if (isGemini) {
+      body.reasoning_effort = "none";
+    }
+
     const res = await fetch(url, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         authorization: "Bearer " + cfg.apiKey
       },
-      body: JSON.stringify({
-        model: cfg.model,
-        max_tokens: maxTokens,
-        temperature: 0.95,
-        messages: [{ role: "system", content: system }, ...messages.map((m) => ({ role: m.role, content: m.content }))]
-      })
+      body: JSON.stringify(body)
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       throw new Error(data?.error?.message || `Request failed (${res.status})`);
     }
-    const text = data?.choices?.[0]?.message?.content?.trim();
-    if (!text) throw new Error("Empty response from provider.");
+    const choice = data?.choices?.[0];
+    const text = choice?.message?.content?.trim();
+    if (!text) {
+      if (choice?.finish_reason === "length" || choice?.finish_reason === "MAX_TOKENS") {
+        throw new Error("Response cut off before any text was generated — try again, it usually recovers.");
+      }
+      throw new Error("Empty response from provider.");
+    }
     return text;
   },
 
@@ -173,7 +191,7 @@ const API = {
       const reply = await this.send({
         system: "Reply with exactly one word: OK",
         messages: [{ role: "user", content: "Connection test." }],
-        maxTokens: 16
+        maxTokens: 64
       });
       return { ok: true, reply };
     } catch (err) {
