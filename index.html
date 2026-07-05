@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+<title>Confidant — AI Character Chat</title>
+<meta name="description" content="A private character roleplay chat powered by your own AI API key." />
+<meta name="theme-color" content="#14101f" />
+<link rel="manifest" href="manifest.json" />
+<link rel="icon" href="icons/icon-192.png" />
+<link rel="apple-touch-icon" href="icons/icon-192.png" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<div id="toast-root" class="toast-root" aria-live="polite"></div>
+
+<!-- ============ SETUP SCREEN ============ -->
+<section id="screen-setup" class="screen active">
+  <div class="setup-wrap">
+    <div class="brand-mark">
+      <div class="brand-sigil"></div>
+      <h1>Confidant</h1>
+      <p class="brand-tag">Characters that remember. Powered by your own key.</p>
+    </div>
+
+    <div class="card setup-card">
+      <div class="field-group">
+        <label class="field-label">Provider</label>
+        <div class="segmented" id="provider-segmented">
+          <button type="button" class="seg-btn active" data-provider="anthropic">Anthropic</button>
+          <button type="button" class="seg-btn" data-provider="openai">OpenAI‑compatible</button>
+        </div>
+        <p class="field-hint" id="provider-hint">Works directly from the browser with your Anthropic API key.</p>
+      </div>
+
+      <div class="field-group">
+        <label class="field-label" for="input-baseurl">API base URL</label>
+        <input id="input-baseurl" class="text-input" type="text" spellcheck="false" autocomplete="off" />
+      </div>
+
+      <div class="field-group">
+        <label class="field-label" for="input-model">Model</label>
+        <input id="input-model" class="text-input" type="text" spellcheck="false" autocomplete="off" />
+      </div>
+
+      <div class="field-group">
+        <label class="field-label" for="input-apikey">API key</label>
+        <div class="key-input-row">
+          <input id="input-apikey" class="text-input" type="password" spellcheck="false" autocomplete="off" placeholder="sk-… / your provider key" />
+          <button type="button" id="btn-toggle-key" class="icon-btn" aria-label="Show key">👁</button>
+        </div>
+        <p class="field-hint">Stored only on this device. Never sent anywhere but the provider you chose.</p>
+      </div>
+
+      <button id="btn-validate" class="btn-primary btn-block">Connect</button>
+      <p class="field-hint setup-note" id="setup-status"></p>
+      <details class="cors-note">
+        <summary>Getting a network / CORS error?</summary>
+        <p>Some providers block requests sent directly from a browser. Anthropic and OpenRouter both allow it. If your provider blocks it, you'll need a small proxy server in front of it.</p>
+      </details>
+    </div>
+  </div>
+</section>
+
+<!-- ============ HOME SCREEN ============ -->
+<section id="screen-home" class="screen">
+  <header class="topbar">
+    <div class="topbar-brand">
+      <div class="brand-sigil small"></div>
+      <span>Confidant</span>
+    </div>
+    <button class="icon-btn" id="btn-open-settings" aria-label="Settings">⚙</button>
+  </header>
+
+  <div class="home-content">
+    <button class="quick-chat-banner" id="btn-quick-chat">
+      <div class="qc-icon">💬</div>
+      <div class="qc-text">
+        <strong>Quick Chat</strong>
+        <span>Jump straight in — no character setup</span>
+      </div>
+      <div class="qc-arrow">›</div>
+    </button>
+
+    <div class="section-row">
+      <h2>Your characters</h2>
+      <button id="btn-new-character" class="btn-ghost-small">+ New</button>
+    </div>
+
+    <div id="character-list" class="character-list">
+      <!-- populated by JS -->
+    </div>
+
+    <div id="empty-state" class="empty-state" hidden>
+      <p>No characters yet.</p>
+      <p class="empty-sub">Describe someone in a sentence and Confidant will build the rest.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ CHARACTER CREATE SCREEN ============ -->
+<section id="screen-create" class="screen">
+  <header class="topbar">
+    <button class="icon-btn" id="btn-create-back" aria-label="Back">←</button>
+    <span class="topbar-title">New character</span>
+    <span class="topbar-spacer"></span>
+  </header>
+
+  <div class="create-content">
+    <label class="field-label" for="input-char-desc">Describe them in a sentence or two</label>
+    <textarea id="input-char-desc" class="text-area" rows="4" placeholder="e.g. a retired sea captain who's gruff on the outside but writes poetry no one's ever read"></textarea>
+    <button id="btn-generate-character" class="btn-primary btn-block">Generate character</button>
+
+    <div id="create-loading" class="create-loading" hidden>
+      <div class="spinner"></div>
+      <p id="create-loading-text">Writing their history…</p>
+    </div>
+
+    <div id="character-preview" class="character-preview" hidden>
+      <div class="preview-header">
+        <div class="char-avatar" id="preview-avatar"></div>
+        <div>
+          <h3 id="preview-name"></h3>
+          <p id="preview-tagline" class="preview-tagline"></p>
+        </div>
+      </div>
+      <div class="preview-block">
+        <h4>Biography</h4>
+        <p id="preview-bio"></p>
+      </div>
+      <div class="preview-block">
+        <h4>Personality</h4>
+        <p id="preview-personality"></p>
+      </div>
+      <div class="preview-block">
+        <h4>Speech style</h4>
+        <p id="preview-speech"></p>
+      </div>
+      <div class="preview-block">
+        <h4>Rules & boundaries</h4>
+        <p id="preview-rules"></p>
+      </div>
+      <button id="btn-save-character" class="btn-primary btn-block">Start chatting</button>
+      <button id="btn-regenerate-character" class="btn-ghost btn-block">Regenerate</button>
+    </div>
+  </div>
+</section>
+
+<!-- ============ CHAT SCREEN ============ -->
+<section id="screen-chat" class="screen">
+  <header class="topbar chat-topbar">
+    <button class="icon-btn" id="btn-chat-back" aria-label="Back">←</button>
+    <div class="chat-topbar-identity" id="btn-open-char-info">
+      <div class="char-avatar small" id="chat-avatar"></div>
+      <div class="chat-identity-text">
+        <strong id="chat-char-name">Quick Chat</strong>
+        <span id="chat-char-status">online</span>
+      </div>
+    </div>
+    <button class="icon-btn" id="btn-chat-menu" aria-label="More">⋮</button>
+  </header>
+
+  <div id="chat-menu" class="dropdown-menu" hidden>
+    <button id="menu-view-memory">View memory</button>
+    <button id="menu-reset-convo">Reset conversation</button>
+    <button id="menu-delete-character" class="danger">Delete character</button>
+  </div>
+
+  <div id="chat-messages" class="chat-messages"></div>
+
+  <div id="typing-indicator" class="typing-indicator" hidden>
+    <span></span><span></span><span></span>
+  </div>
+
+  <form id="chat-form" class="chat-input-bar">
+    <textarea id="chat-input" class="chat-textarea" placeholder="Message… try *an action* or `emphasis` or #priority" rows="1"></textarea>
+    <button type="submit" class="btn-send" id="btn-send" aria-label="Send">➤</button>
+  </form>
+</section>
+
+<!-- ============ MEMORY VIEW SCREEN ============ -->
+<section id="screen-memory" class="screen">
+  <header class="topbar">
+    <button class="icon-btn" id="btn-memory-back" aria-label="Back">←</button>
+    <span class="topbar-title">Memory</span>
+    <span class="topbar-spacer"></span>
+  </header>
+  <div class="create-content">
+    <div class="preview-block">
+      <h4>About you (shared across all characters)</h4>
+      <ul id="memory-user-list" class="memory-list"></ul>
+      <p class="field-hint" id="memory-user-empty">Nothing learned yet — mention things about yourself in chat.</p>
+    </div>
+    <div class="preview-block">
+      <h4 id="memory-char-title">Relationship with this character</h4>
+      <p id="memory-char-summary" class="memory-summary"></p>
+      <ul id="memory-char-facts" class="memory-list"></ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============ SETTINGS SCREEN ============ -->
+<section id="screen-settings" class="screen">
+  <header class="topbar">
+    <button class="icon-btn" id="btn-settings-back" aria-label="Back">←</button>
+    <span class="topbar-title">Settings</span>
+    <span class="topbar-spacer"></span>
+  </header>
+  <div class="create-content">
+    <div class="preview-block">
+      <h4>Connection</h4>
+      <p class="field-hint" id="settings-connection-info"></p>
+      <button id="btn-change-key" class="btn-ghost btn-block">Change API key / provider</button>
+    </div>
+    <div class="preview-block">
+      <h4>Formatting guide</h4>
+      <p class="field-hint"><span class="fmt-action">*text*</span> for actions · <span class="fmt-emph">`text`</span> for emphasis · <span class="fmt-priority">#text</span> for high priority</p>
+    </div>
+    <div class="preview-block">
+      <h4>Data</h4>
+      <button id="btn-wipe-all" class="btn-ghost btn-block danger-ghost">Erase all local data</button>
+    </div>
+  </div>
+</section>
+
+<script src="app.js"></script>
+</body>
+</html>
