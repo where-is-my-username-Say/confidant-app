@@ -10,6 +10,7 @@ const Storage = {
       const raw = localStorage.getItem(this.prefix + key);
       return raw === null ? fallback : JSON.parse(raw);
     } catch (e) {
+      console.warn("Storage read failed for", key, e);
       return fallback;
     }
   },
@@ -19,6 +20,7 @@ const Storage = {
       return true;
     } catch (e) {
       console.error("Storage write failed", e);
+      toast("Couldn't save — your device storage may be full.", true);
       return false;
     }
   },
@@ -37,6 +39,7 @@ const Storage = {
    ========================================================================= */
 function toast(message, isError = false) {
   const root = document.getElementById("toast-root");
+  if (!root) return;
   const el = document.createElement("div");
   el.className = "toast" + (isError ? " error" : "");
   el.textContent = message;
@@ -48,11 +51,11 @@ function toast(message, isError = false) {
    FORMATTING ENGINE
    *action* -> physical action / behavior
    `text`   -> emphasis / highlighted statement
-   #text    -> high priority (runs to end of line, or to next #)
+   #text    -> high priority (balanced #..# or to end of line)
    ========================================================================= */
 const Format = {
   escapeHtml(str) {
-    return str
+    return String(str)
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;");
@@ -79,8 +82,9 @@ const Format = {
    ========================================================================= */
 function hashString(str) {
   let h = 0;
-  for (let i = 0; i < str.length; i++) {
-    h = (h << 5) - h + str.charCodeAt(i);
+  const s = String(str || "");
+  for (let i = 0; i < s.length; i++) {
+    h = (h << 5) - h + s.charCodeAt(i);
     h |= 0;
   }
   return Math.abs(h);
@@ -90,31 +94,74 @@ function colorForName(name) {
   return `hsl(${hue}, 50%, 58%)`;
 }
 function initialForName(name) {
-  return (name || "?").trim().charAt(0).toUpperCase() || "?";
+  return String(name || "?").trim().charAt(0).toUpperCase() || "?";
 }
 
 /* =========================================================================
    API CLIENT — model-agnostic (Anthropic Messages API or any
-   OpenAI-compatible /chat/completions endpoint)
+   OpenAI-compatible /chat/completions endpoint, including Gemini's
+   official OpenAI-compatible layer)
    ========================================================================= */
 const API = {
+  DEFAULT_TIMEOUT_MS: 45000,
+  MAX_RETRIES: 2, // extra attempts after the first, only for transient errors
+
   config() {
     return Storage.get("apiConfig", null);
   },
 
   async send({ system, messages, maxTokens = 1024 }) {
     const cfg = this.config();
-    if (!cfg) throw new Error("No API configuration found.");
+    if (!cfg) throw new Error("No API configuration found. Set up your key in Settings.");
+    if (!navigator.onLine) throw new Error("You're offline — reconnect and try again.");
 
-    if (cfg.provider === "anthropic") {
-      return this._sendAnthropic(cfg, system, messages, maxTokens);
+    const attemptFn =
+      cfg.provider === "anthropic"
+        ? () => this._sendAnthropic(cfg, system, messages, maxTokens)
+        : () => this._sendOpenAI(cfg, system, messages, maxTokens);
+
+    return this._withRetry(attemptFn);
+  },
+
+  async _withRetry(fn) {
+    let lastErr;
+    for (let attempt = 0; attempt <= this.MAX_RETRIES; attempt++) {
+      try {
+        return await fn();
+      } catch (err) {
+        lastErr = err;
+        const retryable = err.retryable === true;
+        if (!retryable || attempt === this.MAX_RETRIES) throw err;
+        await new Promise((r) => setTimeout(r, 500 * Math.pow(2, attempt))); // 0.5s, 1s
+      }
     }
-    return this._sendOpenAI(cfg, system, messages, maxTokens);
+    throw lastErr;
+  },
+
+  async _fetchWithTimeout(url, options) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.DEFAULT_TIMEOUT_MS);
+    try {
+      return await fetch(url, { ...options, signal: controller.signal });
+    } catch (err) {
+      if (err.name === "AbortError") {
+        throw new Error("The request timed out. Check your connection and try again.");
+      }
+      throw new Error("Network request failed — check the base URL and your connection.");
+    } finally {
+      clearTimeout(timer);
+    }
+  },
+
+  _throwFromStatus(status, message) {
+    const err = new Error(message || `Request failed (${status})`);
+    err.retryable = status === 429 || status >= 500;
+    throw err;
   },
 
   async _sendAnthropic(cfg, system, messages, maxTokens) {
     const url = cfg.baseUrl.replace(/\/+$/, "") + "/v1/messages";
-    const res = await fetch(url, {
+    const res = await this._fetchWithTimeout(url, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -130,15 +177,20 @@ const API = {
       })
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      throw new Error(data?.error?.message || `Request failed (${res.status})`);
-    }
+    if (!res.ok) this._throwFromStatus(res.status, data?.error?.message);
+
     const text = (data.content || [])
       .filter((b) => b.type === "text")
       .map((b) => b.text)
       .join("\n")
       .trim();
-    if (!text) throw new Error("Empty response from provider.");
+
+    if (!text) {
+      if (data.stop_reason === "max_tokens") {
+        throw new Error("Response cut off before any text was generated — try again with a shorter message.");
+      }
+      throw new Error("Empty response from provider.");
+    }
     return text;
   },
 
@@ -161,7 +213,7 @@ const API = {
       body.reasoning_effort = "none";
     }
 
-    const res = await fetch(url, {
+    const res = await this._fetchWithTimeout(url, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -170,9 +222,8 @@ const API = {
       body: JSON.stringify(body)
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      throw new Error(data?.error?.message || `Request failed (${res.status})`);
-    }
+    if (!res.ok) this._throwFromStatus(res.status, data?.error?.message);
+
     const choice = data?.choices?.[0];
     const text = choice?.message?.content?.trim();
     if (!text) {
@@ -213,7 +264,11 @@ const API = {
     const start = cleaned.indexOf("{");
     const end = cleaned.lastIndexOf("}");
     const jsonSlice = start !== -1 && end !== -1 ? cleaned.slice(start, end + 1) : cleaned;
-    return JSON.parse(jsonSlice);
+    try {
+      return JSON.parse(jsonSlice);
+    } catch (e) {
+      throw new Error("The model didn't return valid data — try again.");
+    }
   }
 };
 
@@ -437,11 +492,19 @@ const Chat = {
     const windowMessages = convo.messages.slice(-Memory.LOCAL_WINDOW);
     const system = id === QUICK_ID ? Characters.quickChatSystemPrompt() : Characters.buildSystemPrompt(convo);
 
-    const reply = await API.send({
-      system,
-      messages: windowMessages.map((m) => ({ role: m.role, content: m.content })),
-      maxTokens: 900
-    });
+    let reply;
+    try {
+      reply = await API.send({
+        system,
+        messages: windowMessages.map((m) => ({ role: m.role, content: m.content })),
+        maxTokens: 900
+      });
+    } catch (err) {
+      // Don't persist a user message with no reply attached if the send failed —
+      // save it anyway so nothing is lost, but re-throw for the UI to report.
+      this.saveConvo(id, convo);
+      throw err;
+    }
 
     convo.messages.push({ role: "assistant", content: reply, ts: Date.now() });
     this.saveConvo(id, convo);
@@ -485,6 +548,10 @@ const Chat = {
     convo.messages = [];
     convo.turnCounter = 0;
     convo.memory = { summary: "", facts: [] };
+    // Re-seed the character's opening line so the chat isn't left empty.
+    if (id !== QUICK_ID && convo.greeting) {
+      convo.messages.push({ role: "assistant", content: convo.greeting, ts: Date.now() });
+    }
     this.saveConvo(id, convo);
   }
 };
@@ -494,9 +561,11 @@ const Chat = {
    ========================================================================= */
 const UI = {
   activeChatId: null,
+  _elCache: {},
 
   el(id) {
-    return document.getElementById(id);
+    if (!this._elCache[id]) this._elCache[id] = document.getElementById(id);
+    return this._elCache[id];
   },
 
   showScreen(id) {
@@ -515,6 +584,7 @@ const UI = {
     if (API.config()) {
       this.showScreen("screen-home");
       this.renderCharacterList();
+      this.refreshSettingsInfo();
     } else {
       this.showScreen("screen-setup");
     }
@@ -522,6 +592,8 @@ const UI = {
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("sw.js").catch(() => {});
     }
+
+    window.addEventListener("offline", () => toast("You're offline. Messages won't send until you're back online.", true));
   },
 
   /* ---------------- SETUP ---------------- */
@@ -532,7 +604,8 @@ const UI = {
     };
     const hints = {
       anthropic: "Works directly from the browser with your Anthropic API key.",
-      openai: "Works with OpenAI or any OpenAI‑compatible endpoint (OpenRouter, Groq, a local server, etc). Edit the base URL for other providers."
+      openai:
+        "Works with OpenAI or any OpenAI‑compatible endpoint (Gemini, OpenRouter, Groq, a local server, etc). Edit the base URL and model for your provider."
     };
 
     let provider = "anthropic";
@@ -579,6 +652,7 @@ const UI = {
         setTimeout(() => {
           this.showScreen("screen-home");
           this.renderCharacterList();
+          this.refreshSettingsInfo();
         }, 400);
       } catch (err) {
         status.textContent = err.message || "Couldn't connect. Check your key, URL, and model.";
@@ -592,7 +666,10 @@ const UI = {
 
   /* ---------------- HOME ---------------- */
   wireHomeScreen() {
-    this.el("btn-open-settings").addEventListener("click", () => this.showScreen("screen-settings"));
+    this.el("btn-open-settings").addEventListener("click", () => {
+      this.refreshSettingsInfo();
+      this.showScreen("screen-settings");
+    });
     this.el("btn-new-character").addEventListener("click", () => {
       this.el("input-char-desc").value = "";
       this.el("character-preview").hidden = true;
@@ -711,10 +788,6 @@ const UI = {
       if (!confirm("Clear this conversation and its memory? This can't be undone.")) return;
       Chat.resetConvo(this.activeChatId);
       this.renderMessages();
-      const convo = Chat.getConvo(this.activeChatId);
-      if (this.activeChatId !== QUICK_ID && convo.greeting) {
-        // keep the character's opening line after a reset
-      }
       toast("Conversation reset.");
     });
 
@@ -745,7 +818,7 @@ const UI = {
     this.el("chat-form").addEventListener("submit", async (e) => {
       e.preventDefault();
       const text = textarea.value.trim();
-      if (!text) return;
+      if (!text || this.el("btn-send").disabled) return;
       textarea.value = "";
       textarea.style.height = "auto";
 
@@ -759,6 +832,7 @@ const UI = {
         toast(err.message || "Message failed to send.", true);
       } finally {
         this.setSending(false);
+        textarea.focus();
       }
     });
   },
@@ -792,27 +866,40 @@ const UI = {
     const convo = Chat.getConvo(this.activeChatId);
     const container = this.el("chat-messages");
     container.innerHTML = "";
-    (convo.messages || []).forEach((m) => this.appendMessageBubble(m, false));
+    const frag = document.createDocumentFragment();
+    (convo.messages || []).forEach((m) => frag.appendChild(this.buildMessageRow(m)));
+    container.appendChild(frag);
     this.scrollChatToBottom();
   },
 
-  appendMessageBubble(m, scroll = true) {
-    const container = this.el("chat-messages");
+  buildMessageRow(m) {
     const row = document.createElement("div");
     row.className = "msg-row " + m.role;
 
-    let avatarHtml = "";
     if (m.role === "assistant") {
       const isQuick = this.activeChatId === QUICK_ID;
       const convo = isQuick ? null : Chat.getConvo(this.activeChatId);
       const bg = isQuick ? "var(--plum)" : convo.color;
       const letter = isQuick ? "Q" : initialForName(convo.name);
-      avatarHtml = `<div class="msg-avatar" style="background:${bg}">${letter}</div>`;
+      const avatar = document.createElement("div");
+      avatar.className = "msg-avatar";
+      avatar.style.background = bg;
+      avatar.textContent = letter;
+      row.appendChild(avatar);
     }
 
-    row.innerHTML = `${avatarHtml}<div class="msg-bubble">${Format.render(m.content)}</div>`;
-    container.appendChild(row);
-    if (scroll) this.scrollChatToBottom();
+    const bubble = document.createElement("div");
+    bubble.className = "msg-bubble";
+    bubble.innerHTML = Format.render(m.content);
+    row.appendChild(bubble);
+
+    return row;
+  },
+
+  appendMessageBubble(m) {
+    const container = this.el("chat-messages");
+    container.appendChild(this.buildMessageRow(m));
+    this.scrollChatToBottom();
   },
 
   scrollChatToBottom() {
@@ -869,14 +956,14 @@ const UI = {
 
   refreshSettingsInfo() {
     const cfg = API.config();
-    if (!cfg) return;
+    const info = this.el("settings-connection-info");
+    if (!cfg) {
+      info.textContent = "Not connected.";
+      return;
+    }
     const label = cfg.provider === "anthropic" ? "Anthropic" : "OpenAI‑compatible";
-    this.el("settings-connection-info").textContent = `${label} · ${cfg.model} · ${cfg.baseUrl}`;
+    info.textContent = `${label} · ${cfg.model} · ${cfg.baseUrl}`;
   }
 };
 
-document.addEventListener("DOMContentLoaded", () => {
-  UI.init();
-  UI.refreshSettingsInfo();
-  document.getElementById("btn-open-settings").addEventListener("click", () => UI.refreshSettingsInfo());
-});
+document.addEventListener("DOMContentLoaded", () => UI.init());
