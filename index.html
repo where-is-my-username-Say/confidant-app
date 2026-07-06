@@ -286,12 +286,26 @@
       <p class="field-hint">Uses your phone's fingerprint / face / PIN to gate opening the app. This checks your device only — nothing is sent anywhere.</p>
     </div>
     <div class="preview-block">
+      <h4>Theme</h4>
+      <div class="chip-row" id="theme-chips">
+        <button type="button" class="chip active" data-theme="plum">Plum</button>
+        <button type="button" class="chip" data-theme="slate">Slate</button>
+        <button type="button" class="chip" data-theme="forest">Forest</button>
+        <button type="button" class="chip" data-theme="rose">Rose</button>
+      </div>
+    </div>
+    <div class="preview-block">
       <h4>Formatting guide</h4>
       <p class="field-hint"><span class="fmt-action">*text*</span> for actions · <span class="fmt-emph">`text`</span> for emphasis · <span class="fmt-priority">#text</span> for high priority</p>
     </div>
     <div class="preview-block">
       <h4>Data</h4>
+      <button id="btn-clear-cache" class="btn-ghost btn-block">Clear app cache & reload</button>
+      <p class="field-hint">Use this if a recent update isn't showing up. It only clears cached app files — your characters, chats, and key are untouched.</p>
+      <button id="btn-clear-convos" class="btn-ghost btn-block">Clear all conversations</button>
+      <p class="field-hint">Resets messages and memory for every character (and Quick Chat) but keeps the characters themselves.</p>
       <button id="btn-wipe-all" class="btn-ghost btn-block danger-ghost">Erase all local data</button>
+      <p class="field-hint">Deletes your API key, every character, and all memory from this device.</p>
     </div>
   </div>
 </section>

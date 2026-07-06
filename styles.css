@@ -21,6 +21,20 @@
 
 * { box-sizing: border-box; }
 html, body { height: 100%; }
+
+/* ---------- theme variants ---------- */
+[data-theme="slate"] {
+  --ink: #0e1420; --panel: #172234; --panel-2: #1e2c42; --plum: #1e3a5c;
+  --amber: #5ec9e0; --amber-dim: #3a8ea8; --rose: #e2635a; --lavender: #8fb8d9;
+}
+[data-theme="forest"] {
+  --ink: #10160f; --panel: #1a2418; --panel-2: #223020; --plum: #2d4a24;
+  --amber: #d9b34a; --amber-dim: #a68a38; --rose: #e2837a; --lavender: #a8c99e;
+}
+[data-theme="rose"] {
+  --ink: #1a0f14; --panel: #2a1620; --panel-2: #341c29; --plum: #5c2340;
+  --amber: #e08aa0; --amber-dim: #a85f74; --rose: #e2635a; --lavender: #d9a8bd;
+}
 body {
   margin: 0;
   font-family: var(--font-body);
@@ -582,6 +596,7 @@ button { font-family: inherit; }
   align-items: flex-end;
   animation: overlay-in 0.2s ease both;
 }
+.sheet-overlay[hidden] { display: none; }
 @keyframes overlay-in { from { opacity: 0; } to { opacity: 1; } }
 .sheet-panel {
   width: 100%;

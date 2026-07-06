@@ -34,6 +34,10 @@ const Storage = {
   }
 };
 
+// Applied immediately (not inside DOMContentLoaded) so there's no flash of
+// the default theme before the saved one kicks in.
+document.documentElement.dataset.theme = Storage.get("theme", "plum");
+
 /* =========================================================================
    TOASTS
    ========================================================================= */
@@ -468,6 +472,9 @@ const Memory = {
     });
     if (mem.length > this.MAX_USER_FACTS) mem = mem.slice(mem.length - this.MAX_USER_FACTS);
     Storage.set("userMemory", mem);
+  },
+  setUserMemory(list) {
+    Storage.set("userMemory", list || []);
   },
 
   buildUserMemoryBlock() {
@@ -1470,6 +1477,16 @@ const UI = {
     this.el("btn-settings-back").addEventListener("click", () => this.showScreen("screen-home"));
     this.el("btn-change-key").addEventListener("click", () => this.showScreen("screen-setup"));
 
+    document.querySelectorAll("#theme-chips .chip").forEach((chip) => {
+      chip.classList.toggle("active", chip.dataset.theme === document.documentElement.dataset.theme);
+      chip.addEventListener("click", () => {
+        document.querySelectorAll("#theme-chips .chip").forEach((c) => c.classList.remove("active"));
+        chip.classList.add("active");
+        document.documentElement.dataset.theme = chip.dataset.theme;
+        Storage.set("theme", chip.dataset.theme);
+      });
+    });
+
     this.el("toggle-biometric-lock").addEventListener("change", async (e) => {
       const checked = e.target.checked;
       if (checked) {
@@ -1484,6 +1501,35 @@ const UI = {
         Biometric.disable();
         toast("Biometric lock disabled.");
       }
+    });
+
+    this.el("btn-clear-cache").addEventListener("click", async () => {
+      const btn = this.el("btn-clear-cache");
+      btn.disabled = true;
+      btn.textContent = "Clearing…";
+      try {
+        if ("caches" in window) {
+          const keys = await caches.keys();
+          await Promise.all(keys.map((k) => caches.delete(k)));
+        }
+        if ("serviceWorker" in navigator) {
+          const regs = await navigator.serviceWorker.getRegistrations();
+          await Promise.all(regs.map((r) => r.unregister()));
+        }
+        location.reload(true);
+      } catch (e) {
+        toast("Couldn't clear cache: " + e.message, true);
+        btn.disabled = false;
+        btn.textContent = "Clear app cache & reload";
+      }
+    });
+
+    this.el("btn-clear-convos").addEventListener("click", () => {
+      if (!confirm("Clear messages and memory for every character and Quick Chat? Characters themselves are kept.")) return;
+      Characters.list().forEach((c) => Chat.resetConvo(c.id));
+      Chat.resetConvo(QUICK_ID);
+      Memory.setUserMemory([]);
+      toast("All conversations cleared.");
     });
 
     this.el("btn-wipe-all").addEventListener("click", () => {
