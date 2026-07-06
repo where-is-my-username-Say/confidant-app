@@ -1,6 +1,6 @@
 // Confidant service worker — caches the app shell only.
 // Network calls to the user's AI provider always go straight to the network.
-const CACHE_NAME = "confidant-shell-v1";
+const CACHE_NAME = "confidant-shell-v2";
 const SHELL_FILES = [
   "./",
   "./index.html",

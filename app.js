@@ -1,7 +1,7 @@
 "use strict";
 
 /* =========================================================================
-   STORAGE — thin namespaced localStorage wrapper
+   STORAGE
    ========================================================================= */
 const Storage = {
   prefix: "confidant.",
@@ -49,9 +49,6 @@ function toast(message, isError = false) {
 
 /* =========================================================================
    FORMATTING ENGINE
-   *action* -> physical action / behavior
-   `text`   -> emphasis / highlighted statement
-   #text    -> high priority (balanced #..# or to end of line)
    ========================================================================= */
 const Format = {
   escapeHtml(str) {
@@ -62,17 +59,10 @@ const Format = {
   },
   render(raw) {
     let text = this.escapeHtml(raw);
-
-    // backtick emphasis: `like this`
     text = text.replace(/`([^`\n]+)`/g, '<span class="fmt-emph">$1</span>');
-
-    // asterisk actions: *like this*
     text = text.replace(/\*([^*\n]+)\*/g, '<span class="fmt-action">$1</span>');
-
-    // priority: balanced #like this# OR # to end of line
     text = text.replace(/#([^#\n]+)#/g, '<span class="fmt-priority">$1</span>');
     text = text.replace(/(^|\n)#([^\n]+)/g, '$1<span class="fmt-priority">$2</span>');
-
     return text;
   }
 };
@@ -96,20 +86,97 @@ function colorForName(name) {
 function initialForName(name) {
   return String(name || "?").trim().charAt(0).toUpperCase() || "?";
 }
+// Renders either an uploaded/generated portrait image or a colored-initial
+// fallback into any avatar element, consistently across the whole app.
+function renderAvatarInto(el, entity, isQuick) {
+  el.innerHTML = "";
+  if (isQuick) {
+    el.style.background = "var(--plum)";
+    el.textContent = "Q";
+    return;
+  }
+  if (entity && entity.avatarImage) {
+    el.style.background = "transparent";
+    const img = document.createElement("img");
+    img.src = entity.avatarImage;
+    img.alt = entity.name || "";
+    img.loading = "lazy";
+    el.appendChild(img);
+  } else {
+    el.style.background = colorForName(entity?.name);
+    el.textContent = initialForName(entity?.name);
+  }
+}
 
 /* =========================================================================
-   API CLIENT — model-agnostic (Anthropic Messages API or any
-   OpenAI-compatible /chat/completions endpoint, including Gemini's
-   official OpenAI-compatible layer)
+   SSE STREAM READER — shared by both provider streaming paths
+   ========================================================================= */
+async function consumeSSE(response, onData, idleTimeoutMs, controller) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let timer;
+  const resetTimer = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => controller.abort(), idleTimeoutMs);
+  };
+  try {
+    while (true) {
+      resetTimer();
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop();
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const payload = trimmed.slice(5).trim();
+        if (payload === "[DONE]") continue;
+        try {
+          onData(JSON.parse(payload));
+        } catch (e) {
+          /* ignore malformed SSE fragments */
+        }
+      }
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/* =========================================================================
+   API CLIENT — model-agnostic, with real token streaming
    ========================================================================= */
 const API = {
-  DEFAULT_TIMEOUT_MS: 45000,
-  MAX_RETRIES: 2, // extra attempts after the first, only for transient errors
+  CONNECT_TIMEOUT_MS: 30000,
+  IDLE_TIMEOUT_MS: 25000,
+  MAX_RETRIES: 2,
 
   config() {
     return Storage.get("apiConfig", null);
   },
 
+  _throwFromStatus(status, message) {
+    const err = new Error(message || `Request failed (${status})`);
+    err.retryable = status === 429 || status >= 500;
+    throw err;
+  },
+
+  async _fetchWithTimeout(url, options, timeoutMs = this.CONNECT_TIMEOUT_MS) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...options, signal: controller.signal });
+    } catch (err) {
+      if (err.name === "AbortError") throw new Error("The request timed out. Check your connection and try again.");
+      throw new Error("Network request failed — check the base URL and your connection.");
+    } finally {
+      clearTimeout(timer);
+    }
+  },
+
+  /* ---------------- non-streaming (used for JSON generation tasks) ---------------- */
   async send({ system, messages, maxTokens = 1024 }) {
     const cfg = this.config();
     if (!cfg) throw new Error("No API configuration found. Set up your key in Settings.");
@@ -120,43 +187,17 @@ const API = {
         ? () => this._sendAnthropic(cfg, system, messages, maxTokens)
         : () => this._sendOpenAI(cfg, system, messages, maxTokens);
 
-    return this._withRetry(attemptFn);
-  },
-
-  async _withRetry(fn) {
     let lastErr;
     for (let attempt = 0; attempt <= this.MAX_RETRIES; attempt++) {
       try {
-        return await fn();
+        return await attemptFn();
       } catch (err) {
         lastErr = err;
-        const retryable = err.retryable === true;
-        if (!retryable || attempt === this.MAX_RETRIES) throw err;
-        await new Promise((r) => setTimeout(r, 500 * Math.pow(2, attempt))); // 0.5s, 1s
+        if (!err.retryable || attempt === this.MAX_RETRIES) throw err;
+        await new Promise((r) => setTimeout(r, 500 * Math.pow(2, attempt)));
       }
     }
     throw lastErr;
-  },
-
-  async _fetchWithTimeout(url, options) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.DEFAULT_TIMEOUT_MS);
-    try {
-      return await fetch(url, { ...options, signal: controller.signal });
-    } catch (err) {
-      if (err.name === "AbortError") {
-        throw new Error("The request timed out. Check your connection and try again.");
-      }
-      throw new Error("Network request failed — check the base URL and your connection.");
-    } finally {
-      clearTimeout(timer);
-    }
-  },
-
-  _throwFromStatus(status, message) {
-    const err = new Error(message || `Request failed (${status})`);
-    err.retryable = status === 429 || status >= 500;
-    throw err;
   },
 
   async _sendAnthropic(cfg, system, messages, maxTokens) {
@@ -169,69 +210,35 @@ const API = {
         "anthropic-version": "2023-06-01",
         "anthropic-dangerous-direct-browser-access": "true"
       },
-      body: JSON.stringify({
-        model: cfg.model,
-        max_tokens: maxTokens,
-        system: system,
-        messages: messages.map((m) => ({ role: m.role, content: m.content }))
-      })
+      body: JSON.stringify({ model: cfg.model, max_tokens: maxTokens, system, messages: messages.map((m) => ({ role: m.role, content: m.content })) })
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) this._throwFromStatus(res.status, data?.error?.message);
-
-    const text = (data.content || [])
-      .filter((b) => b.type === "text")
-      .map((b) => b.text)
-      .join("\n")
-      .trim();
-
-    if (!text) {
-      if (data.stop_reason === "max_tokens") {
-        throw new Error("Response cut off before any text was generated — try again with a shorter message.");
-      }
-      throw new Error("Empty response from provider.");
-    }
+    const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+    if (!text) throw new Error("Empty response from provider.");
     return text;
   },
 
   async _sendOpenAI(cfg, system, messages, maxTokens) {
     const url = cfg.baseUrl.replace(/\/+$/, "") + "/chat/completions";
-    const isGemini = /generativelanguage\.googleapis\.com/i.test(cfg.baseUrl);
-
+    const disablesReasoning = /generativelanguage\.googleapis\.com|api\.x\.ai/i.test(cfg.baseUrl);
     const body = {
       model: cfg.model,
       max_tokens: maxTokens,
       temperature: 0.95,
       messages: [{ role: "system", content: system }, ...messages.map((m) => ({ role: m.role, content: m.content }))]
     };
-
-    // Gemini's "thinking" models spend part of max_tokens on invisible
-    // reasoning before writing a reply, which can leave nothing for the
-    // actual answer on small token budgets. Turning reasoning off keeps
-    // the whole budget available for visible output.
-    if (isGemini) {
-      body.reasoning_effort = "none";
-    }
+    if (disablesReasoning) body.reasoning_effort = "none";
 
     const res = await this._fetchWithTimeout(url, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: "Bearer " + cfg.apiKey
-      },
+      headers: { "content-type": "application/json", authorization: "Bearer " + cfg.apiKey },
       body: JSON.stringify(body)
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) this._throwFromStatus(res.status, data?.error?.message);
-
-    const choice = data?.choices?.[0];
-    const text = choice?.message?.content?.trim();
-    if (!text) {
-      if (choice?.finish_reason === "length" || choice?.finish_reason === "MAX_TOKENS") {
-        throw new Error("Response cut off before any text was generated — try again, it usually recovers.");
-      }
-      throw new Error("Empty response from provider.");
-    }
+    const text = data?.choices?.[0]?.message?.content?.trim();
+    if (!text) throw new Error("Empty response from provider.");
     return text;
   },
 
@@ -239,12 +246,12 @@ const API = {
     const prevConfig = this.config();
     Storage.set("apiConfig", cfg);
     try {
-      const reply = await this.send({
+      await this.send({
         system: "Reply with exactly one word: OK",
         messages: [{ role: "user", content: "Connection test." }],
         maxTokens: 64
       });
-      return { ok: true, reply };
+      return { ok: true };
     } catch (err) {
       if (prevConfig) Storage.set("apiConfig", prevConfig);
       else Storage.remove("apiConfig");
@@ -252,14 +259,8 @@ const API = {
     }
   },
 
-  // Ask the model to extract structured JSON. Strips stray code fences
-  // defensively in case the provider ignores the "JSON only" instruction.
   async requestJSON({ system, user, maxTokens = 1200 }) {
-    const raw = await this.send({
-      system,
-      messages: [{ role: "user", content: user }],
-      maxTokens
-    });
+    const raw = await this.send({ system, messages: [{ role: "user", content: user }], maxTokens });
     const cleaned = raw.replace(/^```(json)?/i, "").replace(/```$/, "").trim();
     const start = cleaned.indexOf("{");
     const end = cleaned.lastIndexOf("}");
@@ -269,17 +270,191 @@ const API = {
     } catch (e) {
       throw new Error("The model didn't return valid data — try again.");
     }
+  },
+
+  /* ---------------- streaming (used for live chat replies) ---------------- */
+  async stream({ system, messages, maxTokens = 900, onToken }) {
+    const cfg = this.config();
+    if (!cfg) throw new Error("No API configuration found. Set up your key in Settings.");
+    if (!navigator.onLine) throw new Error("You're offline — reconnect and try again.");
+
+    let full = "";
+    let receivedAny = false;
+    const wrappedOnToken = (t) => {
+      if (!t) return;
+      full += t;
+      receivedAny = true;
+      if (onToken) onToken(t, full);
+    };
+
+    const attempt = async () => {
+      full = "";
+      receivedAny = false;
+      if (cfg.provider === "anthropic") await this._streamAnthropic(cfg, system, messages, maxTokens, wrappedOnToken);
+      else await this._streamOpenAI(cfg, system, messages, maxTokens, wrappedOnToken);
+      if (!full.trim()) throw new Error("Empty response from provider.");
+      return full;
+    };
+
+    try {
+      return await attempt();
+    } catch (err) {
+      if (!receivedAny && err.retryable) {
+        try {
+          return await attempt();
+        } catch (err2) {
+          err2.partialText = full;
+          throw err2;
+        }
+      }
+      err.partialText = full;
+      throw err;
+    }
+  },
+
+  async _streamAnthropic(cfg, system, messages, maxTokens, onToken) {
+    const url = cfg.baseUrl.replace(/\/+$/, "") + "/v1/messages";
+    const controller = new AbortController();
+    const connectTimer = setTimeout(() => controller.abort(), this.CONNECT_TIMEOUT_MS);
+    let res;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": cfg.apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true"
+        },
+        body: JSON.stringify({
+          model: cfg.model,
+          max_tokens: maxTokens,
+          system,
+          stream: true,
+          messages: messages.map((m) => ({ role: m.role, content: m.content }))
+        })
+      });
+    } catch (err) {
+      throw new Error(err.name === "AbortError" ? "Connection timed out." : "Network request failed — check the base URL and your connection.");
+    } finally {
+      clearTimeout(connectTimer);
+    }
+
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      this._throwFromStatus(res.status, errBody?.error?.message);
+    }
+
+    await consumeSSE(
+      res,
+      (obj) => {
+        if (obj.type === "content_block_delta" && obj.delta?.type === "text_delta") onToken(obj.delta.text);
+      },
+      this.IDLE_TIMEOUT_MS,
+      controller
+    ).catch((err) => {
+      if (err.name === "AbortError") throw new Error("Connection stalled — try again.");
+      throw err;
+    });
+  },
+
+  async _streamOpenAI(cfg, system, messages, maxTokens, onToken) {
+    const url = cfg.baseUrl.replace(/\/+$/, "") + "/chat/completions";
+    const disablesReasoning = /generativelanguage\.googleapis\.com|api\.x\.ai/i.test(cfg.baseUrl);
+    const body = {
+      model: cfg.model,
+      max_tokens: maxTokens,
+      temperature: 0.95,
+      stream: true,
+      messages: [{ role: "system", content: system }, ...messages.map((m) => ({ role: m.role, content: m.content }))]
+    };
+    if (disablesReasoning) body.reasoning_effort = "none";
+
+    const controller = new AbortController();
+    const connectTimer = setTimeout(() => controller.abort(), this.CONNECT_TIMEOUT_MS);
+    let res;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        signal: controller.signal,
+        headers: { "content-type": "application/json", authorization: "Bearer " + cfg.apiKey },
+        body: JSON.stringify(body)
+      });
+    } catch (err) {
+      throw new Error(err.name === "AbortError" ? "Connection timed out." : "Network request failed — check the base URL and your connection.");
+    } finally {
+      clearTimeout(connectTimer);
+    }
+
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      this._throwFromStatus(res.status, errBody?.error?.message);
+    }
+
+    await consumeSSE(
+      res,
+      (obj) => {
+        const delta = obj.choices?.[0]?.delta?.content;
+        if (delta) onToken(delta);
+      },
+      this.IDLE_TIMEOUT_MS,
+      controller
+    ).catch((err) => {
+      if (err.name === "AbortError") throw new Error("Connection stalled — try again.");
+      throw err;
+    });
+  },
+
+  /* ---------------- best-effort character portrait generation ---------------- */
+  async generateImage(prompt) {
+    const cfg = this.config();
+    if (!cfg) throw new Error("No API configuration found.");
+    if (cfg.provider === "anthropic") {
+      throw new Error("Image generation isn't available with Anthropic's API.");
+    }
+    const isGemini = /generativelanguage\.googleapis\.com/i.test(cfg.baseUrl);
+    const url = cfg.baseUrl.replace(/\/+$/, "") + "/images/generations";
+    const candidateModels = isGemini
+      ? ["gemini-2.5-flash-image", "gemini-3-pro-image-preview"]
+      : ["gpt-image-1", "dall-e-3"];
+    let lastErr;
+    for (const model of candidateModels) {
+      try {
+        const res = await this._fetchWithTimeout(
+          url,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json", authorization: "Bearer " + cfg.apiKey },
+            body: JSON.stringify({ model, prompt, size: "512x512", n: 1 })
+          },
+          45000
+        );
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          lastErr = new Error(data?.error?.message || `Request failed (${res.status})`);
+          continue;
+        }
+        const item = data?.data?.[0];
+        if (item?.b64_json) return `data:image/png;base64,${item.b64_json}`;
+        if (item?.url) return item.url;
+        lastErr = new Error("No image returned.");
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr || new Error("Image generation isn't available for this provider.");
   }
 };
 
 /* =========================================================================
-   MEMORY MANAGER — three layers: local (session), user (global), character
+   MEMORY MANAGER — three layers
    ========================================================================= */
 const Memory = {
   MAX_USER_FACTS: 40,
   MAX_CHAR_FACTS: 24,
-  LOCAL_WINDOW: 24, // messages kept verbatim in the model context
-  CONSOLIDATE_EVERY: 8, // user turns between AI memory-consolidation passes
+  LOCAL_WINDOW: 24,
+  CONSOLIDATE_EVERY: 8,
 
   getUserMemory() {
     return Storage.get("userMemory", []);
@@ -293,9 +468,6 @@ const Memory = {
     });
     if (mem.length > this.MAX_USER_FACTS) mem = mem.slice(mem.length - this.MAX_USER_FACTS);
     Storage.set("userMemory", mem);
-  },
-  setUserMemory(list) {
-    Storage.set("userMemory", list);
   },
 
   buildUserMemoryBlock() {
@@ -311,7 +483,6 @@ const Memory = {
     return `Summary: ${summary}\nKey facts:\n${facts}`;
   },
 
-  // Lightweight heuristic extraction — instant, no API call needed.
   quickExtract(userText) {
     const facts = [];
     const patterns = [
@@ -329,12 +500,8 @@ const Memory = {
     return facts;
   },
 
-  // Deeper AI-driven consolidation of recent turns into durable memory.
   async consolidate(recentMessages, existingCharMemory) {
-    const transcript = recentMessages
-      .map((m) => `${m.role === "user" ? "User" : "Character"}: ${m.content}`)
-      .join("\n");
-
+    const transcript = recentMessages.map((m) => `${m.role === "user" ? "User" : "Character"}: ${m.content}`).join("\n");
     const system =
       "You extract durable memory from a roleplay conversation. Respond with ONLY minified JSON, no markdown, no commentary. " +
       'Shape: {"userFacts": string[], "relationshipSummary": string, "characterFacts": string[]}. ' +
@@ -342,12 +509,10 @@ const Memory = {
       "relationshipSummary: an updated 1-3 sentence summary of the narrative/relationship so far, written in third person. " +
       "characterFacts: short bullet facts about shared history or events in the story worth remembering (empty array if none new). " +
       "Only include genuinely new, durable information — skip small talk and anything already obvious.";
-
     const user =
       `EXISTING RELATIONSHIP SUMMARY:\n${existingCharMemory?.summary || "(none yet)"}\n\n` +
       `EXISTING KEY FACTS:\n${(existingCharMemory?.facts || []).join("; ") || "(none yet)"}\n\n` +
       `RECENT CONVERSATION:\n${transcript}`;
-
     return API.requestJSON({ system, user, maxTokens: 500 });
   }
 };
@@ -376,22 +541,44 @@ const Characters = {
     return Object.values(this.all()).sort((a, b) => b.createdAt - a.createdAt);
   },
 
-  async generate(description) {
+  duplicate(id) {
+    const original = this.get(id);
+    if (!original) return null;
+    const copy = JSON.parse(JSON.stringify(original));
+    copy.id = "char_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+    copy.name = original.name + " (copy)";
+    copy.createdAt = Date.now();
+    copy.messages = [];
+    copy.turnCounter = 0;
+    copy.memory = { summary: "", facts: [] };
+    if (copy.greeting) copy.messages.push({ role: "assistant", content: copy.greeting, ts: Date.now() });
+    this.save(copy);
+    return copy;
+  },
+
+  async generate(description, { relationship, traits } = {}) {
+    const relLine = relationship ? `Their relationship to the user is: ${relationship}.` : "";
+    const traitsLine = traits && traits.length ? `Personality flavor to strongly incorporate: ${traits.join(", ")}.` : "";
+
     const system =
-      "You are a character design assistant for a roleplay chat app. Given a short description, invent a full, coherent " +
-      "character sheet. Respond with ONLY valid minified JSON, no markdown fences, no commentary. Fields: " +
+      "You are a character design assistant for a roleplay chat app. Given a short description (and optionally a relationship " +
+      "to the user and personality flavor tags), invent a full, coherent character sheet that reflects all of it naturally. " +
+      "Respond with ONLY valid minified JSON, no markdown fences, no commentary. Fields: " +
       'name (string), tagline (string, <=8 words), biography (2-4 sentences), personality (3-5 sentences describing traits, ' +
       "quirks, and emotional tendencies), speechStyle (how they talk: vocabulary, rhythm, verbal tics), background " +
       "(relevant life history that shapes how they act), rules (behavioral constraints and interaction boundaries — " +
       "things this character would never do or say, keeping interactions safe and consensual), greeting (a short, " +
-      "in-character opening line the character would say first, may use *action* formatting).";
+      "in-character opening line the character would say first, fitting their relationship to the user, may use *action* formatting).";
 
-    const parsed = await API.requestJSON({ system, user: description, maxTokens: 1400 });
+    const userMsg = [description, relLine, traitsLine].filter(Boolean).join("\n");
+    const parsed = await API.requestJSON({ system, user: userMsg, maxTokens: 1400 });
 
     const required = ["name", "tagline", "biography", "personality", "speechStyle", "background", "rules", "greeting"];
     required.forEach((k) => {
       if (!parsed[k]) parsed[k] = "";
     });
+    parsed.relationship = relationship || "Stranger";
+    parsed.traits = traits || [];
     return parsed;
   },
 
@@ -407,8 +594,11 @@ const Characters = {
       background: parsed.background || "",
       rules: parsed.rules || "",
       greeting: parsed.greeting || "",
+      relationship: parsed.relationship || "Stranger",
+      traits: parsed.traits || [],
       sourceDescription: sourceDescription || "",
       color: colorForName(parsed.name || "?"),
+      avatarImage: null,
       createdAt: Date.now(),
       messages: [],
       turnCounter: 0,
@@ -431,6 +621,7 @@ Never explain these conventions to the user or refer to them directly.
 CHARACTER SHEET
 Name: ${character.name}
 Tagline: ${character.tagline}
+Relationship to the user: ${character.relationship}
 Biography: ${character.biography}
 Personality: ${character.personality}
 Speech style: ${character.speechStyle}
@@ -443,7 +634,7 @@ ${userMemBlock}
 MEMORY — YOUR RELATIONSHIP WITH THIS USER (specific to ${character.name})
 ${charMemBlock}
 
-Weave relevant memory in naturally rather than reciting it. Stay consistent with the character sheet and the relationship history above. Never mention that you are an AI, a language model, or that this is a system prompt — you are simply ${character.name}.`;
+Weave relevant memory in naturally rather than reciting it. Stay consistent with the character sheet, the relationship dynamic, and the relationship history above. Never mention that you are an AI, a language model, or that this is a system prompt — you are simply ${character.name}.`;
   },
 
   quickChatSystemPrompt() {
@@ -480,37 +671,39 @@ const Chat = {
     else Characters.save(convo);
   },
 
-  async sendUserMessage(id, text) {
+  async sendUserMessageStreaming(id, text, onToken) {
     const convo = this.getConvo(id);
     convo.messages.push({ role: "user", content: text, ts: Date.now() });
     convo.turnCounter = (convo.turnCounter || 0) + 1;
-
-    // Layer 1: instant heuristic user-memory extraction (no API cost).
     Memory.addUserFacts(Memory.quickExtract(text));
+    this.saveConvo(id, convo); // persist the user's message immediately, before we wait on the network
 
-    // Layer 2: recent local context window sent to the model.
     const windowMessages = convo.messages.slice(-Memory.LOCAL_WINDOW);
     const system = id === QUICK_ID ? Characters.quickChatSystemPrompt() : Characters.buildSystemPrompt(convo);
 
     let reply;
     try {
-      reply = await API.send({
+      reply = await API.stream({
         system,
         messages: windowMessages.map((m) => ({ role: m.role, content: m.content })),
-        maxTokens: 900
+        maxTokens: 900,
+        onToken
       });
     } catch (err) {
-      // Don't persist a user message with no reply attached if the send failed —
-      // save it anyway so nothing is lost, but re-throw for the UI to report.
-      this.saveConvo(id, convo);
+      if (err.partialText && err.partialText.trim()) {
+        const freshConvo = this.getConvo(id);
+        freshConvo.messages.push({ role: "assistant", content: err.partialText, ts: Date.now() });
+        this.saveConvo(id, freshConvo);
+      }
       throw err;
     }
 
-    convo.messages.push({ role: "assistant", content: reply, ts: Date.now() });
-    this.saveConvo(id, convo);
+    const freshConvo = this.getConvo(id);
+    freshConvo.messages.push({ role: "assistant", content: reply, ts: Date.now() });
+    freshConvo.turnCounter = convo.turnCounter;
+    this.saveConvo(id, freshConvo);
 
-    // Layer 3: periodic deeper consolidation into durable memory.
-    if (convo.turnCounter % Memory.CONSOLIDATE_EVERY === 0) {
+    if (freshConvo.turnCounter % Memory.CONSOLIDATE_EVERY === 0) {
       this._consolidateInBackground(id);
     }
 
@@ -525,7 +718,7 @@ const Chat = {
 
       if (Array.isArray(result.userFacts)) Memory.addUserFacts(result.userFacts);
 
-      const freshConvo = this.getConvo(id); // re-read in case of concurrent writes
+      const freshConvo = this.getConvo(id);
       freshConvo.memory = freshConvo.memory || { summary: "", facts: [] };
       if (result.relationshipSummary) freshConvo.memory.summary = result.relationshipSummary;
       if (Array.isArray(result.characterFacts) && result.characterFacts.length) {
@@ -538,7 +731,6 @@ const Chat = {
       }
       this.saveConvo(id, freshConvo);
     } catch (e) {
-      // Silent — memory consolidation is a background enhancement, not critical path.
       console.warn("Memory consolidation skipped:", e.message);
     }
   },
@@ -548,7 +740,6 @@ const Chat = {
     convo.messages = [];
     convo.turnCounter = 0;
     convo.memory = { summary: "", facts: [] };
-    // Re-seed the character's opening line so the chat isn't left empty.
     if (id !== QUICK_ID && convo.greeting) {
       convo.messages.push({ role: "assistant", content: convo.greeting, ts: Date.now() });
     }
@@ -557,11 +748,109 @@ const Chat = {
 };
 
 /* =========================================================================
+   BIOMETRIC (WEBAUTHN) LOCAL DEVICE LOCK
+   This verifies against the device's own platform authenticator only —
+   there is no server, so it's a local gate, not a remote account login.
+   ========================================================================= */
+const Biometric = {
+  async isAvailable() {
+    if (!window.PublicKeyCredential || !navigator.credentials) return false;
+    try {
+      return await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+    } catch (e) {
+      return false;
+    }
+  },
+  isEnabled() {
+    return Storage.get("biometricEnabled", false);
+  },
+  async enroll() {
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
+    const userId = crypto.getRandomValues(new Uint8Array(16));
+    const cred = await navigator.credentials.create({
+      publicKey: {
+        challenge,
+        rp: { name: "Confidant" },
+        user: { id: userId, name: "confidant-user", displayName: "Confidant" },
+        pubKeyCredParams: [
+          { type: "public-key", alg: -7 },
+          { type: "public-key", alg: -257 }
+        ],
+        authenticatorSelection: { authenticatorAttachment: "platform", userVerification: "required" },
+        timeout: 60000,
+        attestation: "none"
+      }
+    });
+    if (!cred) throw new Error("No credential was created.");
+    const credIdB64 = btoa(String.fromCharCode(...new Uint8Array(cred.rawId)));
+    Storage.set("biometricCredId", credIdB64);
+    Storage.set("biometricEnabled", true);
+  },
+  disable() {
+    Storage.set("biometricEnabled", false);
+    Storage.remove("biometricCredId");
+  },
+  async verify() {
+    const credIdB64 = Storage.get("biometricCredId", null);
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
+    const allowCredentials = credIdB64
+      ? [{ id: Uint8Array.from(atob(credIdB64), (c) => c.charCodeAt(0)), type: "public-key" }]
+      : [];
+    const assertion = await navigator.credentials.get({
+      publicKey: { challenge, allowCredentials, userVerification: "required", timeout: 60000 }
+    });
+    if (!assertion) throw new Error("Verification failed.");
+    return true;
+  }
+};
+
+/* =========================================================================
+   LONG-PRESS HELPER
+   ========================================================================= */
+function addPressHandlers(el, { onTap, onLongPress, holdMs = 480 }) {
+  let timer = null;
+  let fired = false;
+  let startX = 0;
+  let startY = 0;
+
+  const clear = () => {
+    clearTimeout(timer);
+    timer = null;
+  };
+
+  el.addEventListener("pointerdown", (e) => {
+    fired = false;
+    startX = e.clientX;
+    startY = e.clientY;
+    timer = setTimeout(() => {
+      fired = true;
+      if (navigator.vibrate) navigator.vibrate(12);
+      onLongPress();
+    }, holdMs);
+  });
+  el.addEventListener("pointermove", (e) => {
+    if (!timer) return;
+    if (Math.abs(e.clientX - startX) > 10 || Math.abs(e.clientY - startY) > 10) clear();
+  });
+  el.addEventListener("pointerup", () => {
+    const wasFired = fired;
+    clear();
+    if (!wasFired) onTap();
+  });
+  el.addEventListener("pointercancel", clear);
+  el.addEventListener("contextmenu", (e) => e.preventDefault());
+}
+
+/* =========================================================================
    UI CONTROLLER
    ========================================================================= */
 const UI = {
   activeChatId: null,
   _elCache: {},
+  _sheetCharId: null,
+  _selectedRelationship: "Stranger",
+  _selectedTraits: [],
+  _pendingPortrait: null,
 
   el(id) {
     if (!this._elCache[id]) this._elCache[id] = document.getElementById(id);
@@ -573,14 +862,46 @@ const UI = {
     this.el(id).classList.add("active");
   },
 
-  init() {
+  async init() {
+    this.setupViewportUnit();
     this.wireSetupScreen();
     this.wireHomeScreen();
     this.wireCreateScreen();
     this.wireChatScreen();
     this.wireMemoryScreen();
     this.wireSettingsScreen();
+    this.wireSheet();
 
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("sw.js").catch(() => {});
+    }
+    window.addEventListener("offline", () => toast("You're offline. Messages won't send until you're back online.", true));
+
+    const biometricSupported = await Biometric.isAvailable();
+    if (biometricSupported) {
+      this.el("biometric-row").hidden = false;
+      this.el("toggle-biometric-lock").checked = Biometric.isEnabled();
+    }
+
+    if (biometricSupported && Biometric.isEnabled()) {
+      this.showScreen("screen-lock");
+      this.tryUnlock();
+    } else {
+      this.afterUnlock();
+    }
+  },
+
+  setupViewportUnit() {
+    const setVH = () => {
+      const h = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+      document.documentElement.style.setProperty("--vh", h * 0.01 + "px");
+    };
+    setVH();
+    window.addEventListener("resize", setVH);
+    if (window.visualViewport) window.visualViewport.addEventListener("resize", setVH);
+  },
+
+  afterUnlock() {
     if (API.config()) {
       this.showScreen("screen-home");
       this.renderCharacterList();
@@ -588,12 +909,17 @@ const UI = {
     } else {
       this.showScreen("screen-setup");
     }
+  },
 
-    if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.register("sw.js").catch(() => {});
+  async tryUnlock() {
+    const status = this.el("lock-status");
+    status.textContent = "";
+    try {
+      await Biometric.verify();
+      this.afterUnlock();
+    } catch (e) {
+      status.textContent = "Verification failed or cancelled — try again.";
     }
-
-    window.addEventListener("offline", () => toast("You're offline. Messages won't send until you're back online.", true));
   },
 
   /* ---------------- SETUP ---------------- */
@@ -604,22 +930,58 @@ const UI = {
     };
     const hints = {
       anthropic: "Works directly from the browser with your Anthropic API key.",
-      openai:
-        "Works with OpenAI or any OpenAI‑compatible endpoint (Gemini, OpenRouter, Groq, a local server, etc). Edit the base URL and model for your provider."
+      openai: "Pick a preset below, or fill in the base URL and model for any other OpenAI‑compatible provider."
+    };
+
+    // Presets for the "OpenAI‑compatible" family — pick one, paste the matching
+    // key, and the base URL + model are filled in automatically.
+    const PRESETS = {
+      gemini: { baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/", model: "gemini-2.5-flash", note: "Google AI Studio has a genuine free tier — no card required." },
+      openai: { baseUrl: "https://api.openai.com/v1", model: "gpt-4o-mini", note: "Requires a prepaid balance — OpenAI has no free API tier." },
+      openrouter: { baseUrl: "https://openrouter.ai/api/v1", model: "openrouter/auto", note: "Auto-picks a good model per message. Swap in a specific model id (or openrouter/free) any time." },
+      groq: { baseUrl: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile", note: "Free tier with generous rate limits; extremely fast responses." },
+      mistral: { baseUrl: "https://api.mistral.ai/v1", model: "mistral-small-latest", note: "Has a free tier for lower request volumes." },
+      deepseek: { baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat", note: "Inexpensive pay-as-you-go pricing." },
+      together: { baseUrl: "https://api.together.xyz/v1", model: "meta-llama/Llama-3.3-70B-Instruct-Turbo", note: "Pay-as-you-go, some free trial credit for new accounts." },
+      fireworks: { baseUrl: "https://api.fireworks.ai/inference/v1", model: "accounts/fireworks/models/llama-v3p1-70b-instruct", note: "Pay-as-you-go, fast open-weight model hosting." },
+      xai: { baseUrl: "https://api.x.ai/v1", model: "grok-4.3", note: "Paid; xAI sometimes offers free developer credits." },
+      custom: { baseUrl: "", model: "", note: "Enter any OpenAI-compatible base URL and model — a local Ollama/LM Studio server works too." }
     };
 
     let provider = "anthropic";
     const applyProvider = (p) => {
       provider = p;
       document.querySelectorAll("#provider-segmented .seg-btn").forEach((b) => b.classList.toggle("active", b.dataset.provider === p));
-      this.el("input-baseurl").value = providerDefaults[p].baseUrl;
-      this.el("input-model").value = providerDefaults[p].model;
       this.el("provider-hint").textContent = hints[p];
+      this.el("preset-group").hidden = p !== "openai";
+      document.querySelectorAll("#preset-chips .chip").forEach((c) => c.classList.remove("active"));
+      this.el("preset-note").textContent = "";
+      if (p === "anthropic") {
+        this.el("input-baseurl").value = providerDefaults.anthropic.baseUrl;
+        this.el("input-model").value = providerDefaults.anthropic.model;
+      } else {
+        this.el("input-baseurl").value = providerDefaults.openai.baseUrl;
+        this.el("input-model").value = providerDefaults.openai.model;
+      }
     };
     applyProvider("anthropic");
 
     document.querySelectorAll("#provider-segmented .seg-btn").forEach((btn) => {
       btn.addEventListener("click", () => applyProvider(btn.dataset.provider));
+    });
+
+    document.querySelectorAll("#preset-chips .chip").forEach((chip) => {
+      chip.addEventListener("click", () => {
+        document.querySelectorAll("#preset-chips .chip").forEach((c) => c.classList.remove("active"));
+        chip.classList.add("active");
+        const preset = PRESETS[chip.dataset.preset];
+        this.el("input-baseurl").value = preset.baseUrl;
+        this.el("input-model").value = preset.model;
+        this.el("preset-note").textContent = preset.note;
+        if (chip.dataset.preset === "custom") {
+          this.el("input-baseurl").focus();
+        }
+      });
     });
 
     this.el("btn-toggle-key").addEventListener("click", () => {
@@ -674,6 +1036,8 @@ const UI = {
       this.el("input-char-desc").value = "";
       this.el("character-preview").hidden = true;
       this.el("create-loading").hidden = true;
+      this._pendingPortrait = null;
+      this.resetChips();
       this.showScreen("screen-create");
     });
     this.el("btn-quick-chat").addEventListener("click", () => this.openChat(QUICK_ID));
@@ -692,22 +1056,86 @@ const UI = {
     empty.hidden = true;
 
     list.forEach((c) => {
-      const card = document.createElement("button");
+      const card = document.createElement("div");
       card.className = "character-card";
-      card.innerHTML = `
-        <div class="char-avatar" style="background:${c.color}">${initialForName(c.name)}</div>
-        <div class="character-card-text">
-          <strong>${Format.escapeHtml(c.name)}</strong>
-          <span>${Format.escapeHtml(c.tagline || "")}</span>
-        </div>`;
-      card.addEventListener("click", () => this.openChat(c.id));
+      card.setAttribute("role", "button");
+      card.setAttribute("tabindex", "0");
+
+      const avatar = document.createElement("div");
+      avatar.className = "char-avatar";
+      renderAvatarInto(avatar, c, false);
+
+      const textWrap = document.createElement("div");
+      textWrap.className = "character-card-text";
+      textWrap.innerHTML = `<strong>${Format.escapeHtml(c.name)}</strong><span>${Format.escapeHtml(c.tagline || "")}</span>`;
+
+      card.appendChild(avatar);
+      card.appendChild(textWrap);
+      if (c.relationship && c.relationship !== "Stranger") {
+        const badge = document.createElement("span");
+        badge.className = "rel-badge";
+        badge.textContent = c.relationship;
+        card.appendChild(badge);
+      }
+
+      addPressHandlers(card, {
+        onTap: () => this.openChat(c.id),
+        onLongPress: () => this.openSheet(c.id)
+      });
+
       container.appendChild(card);
     });
   },
 
   /* ---------------- CREATE CHARACTER ---------------- */
+  resetChips() {
+    this._selectedRelationship = "Stranger";
+    this._selectedTraits = [];
+    document.querySelectorAll("#relationship-chips .chip").forEach((c) => c.classList.toggle("active", c.dataset.rel === "Stranger"));
+    document.querySelectorAll("#personality-chips .chip").forEach((c) => c.classList.remove("active"));
+    this.el("input-relationship-custom").hidden = true;
+    this.el("input-relationship-custom").value = "";
+  },
+
   wireCreateScreen() {
     this.el("btn-create-back").addEventListener("click", () => this.showScreen("screen-home"));
+
+    document.querySelectorAll("#relationship-chips .chip").forEach((chip) => {
+      chip.addEventListener("click", () => {
+        document.querySelectorAll("#relationship-chips .chip").forEach((c) => c.classList.remove("active"));
+        chip.classList.add("active");
+        const customInput = this.el("input-relationship-custom");
+        if (chip.dataset.rel === "__custom") {
+          customInput.hidden = false;
+          customInput.focus();
+          this._selectedRelationship = customInput.value.trim() || "Custom";
+        } else {
+          customInput.hidden = true;
+          this._selectedRelationship = chip.dataset.rel;
+        }
+      });
+    });
+    this.el("input-relationship-custom").addEventListener("input", (e) => {
+      this._selectedRelationship = e.target.value.trim() || "Custom";
+    });
+
+    document.querySelectorAll("#personality-chips .chip").forEach((chip) => {
+      chip.addEventListener("click", () => {
+        const trait = chip.dataset.trait;
+        const isActive = chip.classList.contains("active");
+        if (isActive) {
+          chip.classList.remove("active");
+          this._selectedTraits = this._selectedTraits.filter((t) => t !== trait);
+        } else {
+          if (this._selectedTraits.length >= 3) {
+            toast("Pick up to 3 traits.", true);
+            return;
+          }
+          chip.classList.add("active");
+          this._selectedTraits.push(trait);
+        }
+      });
+    });
 
     let lastParsed = null;
     let lastDescription = "";
@@ -719,12 +1147,13 @@ const UI = {
         return;
       }
       lastDescription = desc;
+      this._pendingPortrait = null;
       this.el("character-preview").hidden = true;
       this.el("create-loading").hidden = false;
       this.el("btn-generate-character").disabled = true;
 
       try {
-        lastParsed = await Characters.generate(desc);
+        lastParsed = await Characters.generate(desc, { relationship: this._selectedRelationship, traits: this._selectedTraits });
         this.renderCharacterPreview(lastParsed);
         this.el("character-preview").hidden = false;
       } catch (err) {
@@ -738,9 +1167,34 @@ const UI = {
     this.el("btn-generate-character").addEventListener("click", generate);
     this.el("btn-regenerate-character").addEventListener("click", generate);
 
+    this.el("btn-generate-portrait").addEventListener("click", async () => {
+      if (!lastParsed) return;
+      const btn = this.el("btn-generate-portrait");
+      const loading = this.el("portrait-loading");
+      btn.hidden = true;
+      loading.hidden = false;
+      try {
+        const prompt = `Portrait of a character named ${lastParsed.name}. ${lastParsed.biography} Style: warm, painterly, single character portrait, plain background.`;
+        const imageUrl = await API.generateImage(prompt);
+        this._pendingPortrait = imageUrl;
+        const avatarEl = this.el("preview-avatar");
+        avatarEl.innerHTML = "";
+        avatarEl.style.background = "transparent";
+        const img = document.createElement("img");
+        img.src = imageUrl;
+        avatarEl.appendChild(img);
+      } catch (err) {
+        toast(err.message || "Couldn't generate a portrait for this provider.", true);
+      } finally {
+        loading.hidden = true;
+        btn.hidden = false;
+      }
+    });
+
     this.el("btn-save-character").addEventListener("click", () => {
       if (!lastParsed) return;
       const record = Characters.createRecord(lastParsed, lastDescription);
+      if (this._pendingPortrait) record.avatarImage = this._pendingPortrait;
       if (record.greeting) {
         record.messages.push({ role: "assistant", content: record.greeting, ts: Date.now() });
       }
@@ -751,14 +1205,18 @@ const UI = {
   },
 
   renderCharacterPreview(p) {
-    this.el("preview-avatar").style.background = colorForName(p.name);
-    this.el("preview-avatar").textContent = initialForName(p.name);
+    const avatarEl = this.el("preview-avatar");
+    avatarEl.innerHTML = "";
+    avatarEl.style.background = colorForName(p.name);
+    avatarEl.textContent = initialForName(p.name);
     this.el("preview-name").textContent = p.name;
     this.el("preview-tagline").textContent = p.tagline;
     this.el("preview-bio").textContent = p.biography;
     this.el("preview-personality").textContent = p.personality;
     this.el("preview-speech").textContent = p.speechStyle;
     this.el("preview-rules").textContent = p.rules;
+    this.el("btn-generate-portrait").hidden = false;
+    this.el("portrait-loading").hidden = true;
   },
 
   /* ---------------- CHAT ---------------- */
@@ -804,62 +1262,134 @@ const UI = {
     });
 
     const textarea = this.el("chat-input");
+    const sendBtn = this.el("btn-send");
+
     textarea.addEventListener("input", () => {
       textarea.style.height = "auto";
       textarea.style.height = Math.min(textarea.scrollHeight, 120) + "px";
     });
-    textarea.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault();
-        this.el("chat-form").requestSubmit();
-      }
-    });
 
-    this.el("chat-form").addEventListener("submit", async (e) => {
-      e.preventDefault();
+    // Prevent the send button from ever taking focus away from the textarea —
+    // this is what was closing the mobile keyboard on send.
+    sendBtn.addEventListener("pointerdown", (e) => e.preventDefault());
+
+    const submitMessage = async () => {
       const text = textarea.value.trim();
-      if (!text || this.el("btn-send").disabled) return;
+      if (!text || sendBtn.disabled) return;
       textarea.value = "";
       textarea.style.height = "auto";
 
       this.appendMessageBubble({ role: "user", content: text });
       this.setSending(true);
+      this.showTypingDots();
+
+      let bubbleEl = null;
+      let latestFull = "";
+      let rafPending = false;
+
+      const flush = () => {
+        if (bubbleEl) {
+          bubbleEl.innerHTML = Format.render(latestFull) + '<span class="stream-cursor"></span>';
+          this.scrollChatToBottom();
+        }
+        rafPending = false;
+      };
+      const onToken = (token, fullSoFar) => {
+        if (!bubbleEl) {
+          this.hideTypingDots();
+          bubbleEl = this.startStreamingBubble();
+        }
+        latestFull = fullSoFar;
+        if (!rafPending) {
+          rafPending = true;
+          requestAnimationFrame(flush);
+        }
+      };
 
       try {
-        const reply = await Chat.sendUserMessage(this.activeChatId, text);
-        this.appendMessageBubble({ role: "assistant", content: reply });
+        const reply = await Chat.sendUserMessageStreaming(this.activeChatId, text, onToken);
+        this.hideTypingDots();
+        if (bubbleEl) bubbleEl.innerHTML = Format.render(reply);
+        else this.appendMessageBubble({ role: "assistant", content: reply });
       } catch (err) {
-        toast(err.message || "Message failed to send.", true);
+        this.hideTypingDots();
+        if (err.partialText && err.partialText.trim() && bubbleEl) {
+          bubbleEl.innerHTML = Format.render(err.partialText);
+          toast("Connection interrupted — response may be incomplete.", true);
+        } else {
+          if (bubbleEl) bubbleEl.closest(".msg-row")?.remove();
+          toast(err.message || "Message failed to send.", true);
+        }
       } finally {
         this.setSending(false);
         textarea.focus();
+      }
+    };
+
+    this.el("chat-form").addEventListener("submit", (e) => {
+      e.preventDefault();
+      submitMessage();
+    });
+    textarea.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        submitMessage();
       }
     });
   },
 
   setSending(isSending) {
     this.el("btn-send").disabled = isSending;
-    this.el("typing-indicator").hidden = !isSending;
-    if (isSending) this.scrollChatToBottom();
+  },
+
+  showTypingDots() {
+    this.hideTypingDots();
+    const row = document.createElement("div");
+    row.className = "msg-row assistant typing-row";
+    row.id = "active-typing-row";
+    row.innerHTML = '<div class="typing-dots"><span></span><span></span><span></span></div>';
+    this.el("chat-messages").appendChild(row);
+    this.scrollChatToBottom();
+  },
+  hideTypingDots() {
+    const row = document.getElementById("active-typing-row");
+    if (row) row.remove();
+  },
+
+  startStreamingBubble() {
+    const container = this.el("chat-messages");
+    const row = document.createElement("div");
+    row.className = "msg-row assistant";
+
+    const isQuick = this.activeChatId === QUICK_ID;
+    const convo = isQuick ? null : Chat.getConvo(this.activeChatId);
+    const avatar = document.createElement("div");
+    avatar.className = "msg-avatar";
+    renderAvatarInto(avatar, convo, isQuick);
+    row.appendChild(avatar);
+
+    const bubble = document.createElement("div");
+    bubble.className = "msg-bubble";
+    bubble.innerHTML = '<span class="stream-cursor"></span>';
+    row.appendChild(bubble);
+
+    container.appendChild(row);
+    this.scrollChatToBottom();
+    return bubble;
   },
 
   openChat(id) {
     this.activeChatId = id;
     const convo = Chat.getConvo(id);
+    const isQuick = id === QUICK_ID;
 
-    if (id === QUICK_ID) {
-      this.el("chat-char-name").textContent = "Quick Chat";
-      this.el("chat-avatar").style.background = "var(--plum)";
-      this.el("chat-avatar").textContent = "Q";
-    } else {
-      this.el("chat-char-name").textContent = convo.name;
-      this.el("chat-avatar").style.background = convo.color;
-      this.el("chat-avatar").textContent = initialForName(convo.name);
-    }
+    this.el("chat-char-name").textContent = isQuick ? "Quick Chat" : convo.name;
+    renderAvatarInto(this.el("chat-avatar"), convo, isQuick);
 
     this.renderMessages();
     this.showScreen("screen-chat");
     this.scrollChatToBottom();
+    setTimeout(() => this.scrollChatToBottom(), 50);
   },
 
   renderMessages() {
@@ -879,12 +1409,9 @@ const UI = {
     if (m.role === "assistant") {
       const isQuick = this.activeChatId === QUICK_ID;
       const convo = isQuick ? null : Chat.getConvo(this.activeChatId);
-      const bg = isQuick ? "var(--plum)" : convo.color;
-      const letter = isQuick ? "Q" : initialForName(convo.name);
       const avatar = document.createElement("div");
       avatar.className = "msg-avatar";
-      avatar.style.background = bg;
-      avatar.textContent = letter;
+      renderAvatarInto(avatar, convo, isQuick);
       row.appendChild(avatar);
     }
 
@@ -892,7 +1419,6 @@ const UI = {
     bubble.className = "msg-bubble";
     bubble.innerHTML = Format.render(m.content);
     row.appendChild(bubble);
-
     return row;
   },
 
@@ -942,9 +1468,22 @@ const UI = {
   /* ---------------- SETTINGS ---------------- */
   wireSettingsScreen() {
     this.el("btn-settings-back").addEventListener("click", () => this.showScreen("screen-home"));
+    this.el("btn-change-key").addEventListener("click", () => this.showScreen("screen-setup"));
 
-    this.el("btn-change-key").addEventListener("click", () => {
-      this.showScreen("screen-setup");
+    this.el("toggle-biometric-lock").addEventListener("change", async (e) => {
+      const checked = e.target.checked;
+      if (checked) {
+        try {
+          await Biometric.enroll();
+          toast("Biometric lock enabled.");
+        } catch (err) {
+          e.target.checked = false;
+          toast("Couldn't set up biometrics — " + (err.message || "cancelled"), true);
+        }
+      } else {
+        Biometric.disable();
+        toast("Biometric lock disabled.");
+      }
     });
 
     this.el("btn-wipe-all").addEventListener("click", () => {
@@ -963,6 +1502,99 @@ const UI = {
     }
     const label = cfg.provider === "anthropic" ? "Anthropic" : "OpenAI‑compatible";
     info.textContent = `${label} · ${cfg.model} · ${cfg.baseUrl}`;
+  },
+
+  /* ---------------- BOTTOM SHEET (long-press character actions) ---------------- */
+  wireSheet() {
+    const overlay = this.el("sheet-overlay");
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) this.closeSheet();
+    });
+    this.el("sheet-cancel").addEventListener("click", () => this.closeSheet());
+
+    this.el("sheet-open").addEventListener("click", () => {
+      const id = this._sheetCharId;
+      this.closeSheet();
+      this.openChat(id);
+    });
+
+    this.el("sheet-rename").addEventListener("click", () => {
+      const character = Characters.get(this._sheetCharId);
+      if (!character) return;
+      const name = prompt("Rename character", character.name);
+      if (name && name.trim()) {
+        character.name = name.trim();
+        Characters.save(character);
+        this.renderCharacterList();
+      }
+      this.closeSheet();
+    });
+
+    this.el("sheet-portrait").addEventListener("click", async () => {
+      const character = Characters.get(this._sheetCharId);
+      if (!character) return;
+      const btn = this.el("sheet-portrait");
+      btn.textContent = "🎨 Painting…";
+      btn.disabled = true;
+      try {
+        const prompt = `Portrait of a character named ${character.name}. ${character.biography} Style: warm, painterly, single character portrait, plain background.`;
+        const imageUrl = await API.generateImage(prompt);
+        character.avatarImage = imageUrl;
+        Characters.save(character);
+        this.renderCharacterList();
+        toast("Portrait generated.");
+      } catch (err) {
+        toast(err.message || "Couldn't generate a portrait for this provider.", true);
+      } finally {
+        btn.textContent = "🎨 Generate portrait";
+        btn.disabled = false;
+        this.closeSheet();
+      }
+    });
+
+    this.el("sheet-duplicate").addEventListener("click", () => {
+      const copy = Characters.duplicate(this._sheetCharId);
+      if (copy) {
+        this.renderCharacterList();
+        toast(`Duplicated as "${copy.name}".`);
+      }
+      this.closeSheet();
+    });
+
+    this.el("sheet-reset").addEventListener("click", () => {
+      if (!confirm("Reset memory and conversation for this character?")) {
+        this.closeSheet();
+        return;
+      }
+      Chat.resetConvo(this._sheetCharId);
+      toast("Memory reset.");
+      this.closeSheet();
+    });
+
+    this.el("sheet-delete").addEventListener("click", () => {
+      if (!confirm("Delete this character and all memory of them? This can't be undone.")) {
+        this.closeSheet();
+        return;
+      }
+      const wasOpen = this.activeChatId === this._sheetCharId;
+      Characters.delete(this._sheetCharId);
+      this.renderCharacterList();
+      if (wasOpen) this.showScreen("screen-home");
+      this.closeSheet();
+    });
+  },
+
+  openSheet(characterId) {
+    const character = Characters.get(characterId);
+    if (!character) return;
+    this._sheetCharId = characterId;
+    renderAvatarInto(this.el("sheet-avatar"), character, false);
+    this.el("sheet-name").textContent = character.name;
+    this.el("sheet-overlay").hidden = false;
+  },
+  closeSheet() {
+    this.el("sheet-overlay").hidden = true;
+    this._sheetCharId = null;
   }
 };
 

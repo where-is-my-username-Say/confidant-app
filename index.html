@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, interactive-widget=resizes-content" />
 <title>Confidant — AI Character Chat</title>
 <meta name="description" content="A private character roleplay chat powered by your own AI API key." />
 <meta name="theme-color" content="#14101f" />
@@ -20,8 +20,19 @@
 
 <div id="toast-root" class="toast-root" aria-live="polite"></div>
 
+<!-- ============ LOCK SCREEN (optional biometric gate) ============ -->
+<section id="screen-lock" class="screen">
+  <div class="lock-wrap">
+    <div class="brand-sigil pulse"></div>
+    <h1>Confidant is locked</h1>
+    <p class="brand-tag">Unlock with your device's biometrics or PIN.</p>
+    <button id="btn-unlock" class="btn-primary">Unlock</button>
+    <p class="field-hint" id="lock-status"></p>
+  </div>
+</section>
+
 <!-- ============ SETUP SCREEN ============ -->
-<section id="screen-setup" class="screen active">
+<section id="screen-setup" class="screen">
   <div class="setup-wrap">
     <div class="brand-mark">
       <div class="brand-sigil"></div>
@@ -39,20 +50,37 @@
         <p class="field-hint" id="provider-hint">Works directly from the browser with your Anthropic API key.</p>
       </div>
 
+      <div class="field-group" id="preset-group" hidden>
+        <label class="field-label">Quick presets <span class="chip-label-sub">(fills in the fields below)</span></label>
+        <div class="chip-row" id="preset-chips">
+          <button type="button" class="chip" data-preset="gemini">Gemini</button>
+          <button type="button" class="chip" data-preset="openai">OpenAI</button>
+          <button type="button" class="chip" data-preset="openrouter">OpenRouter</button>
+          <button type="button" class="chip" data-preset="groq">Groq</button>
+          <button type="button" class="chip" data-preset="mistral">Mistral</button>
+          <button type="button" class="chip" data-preset="deepseek">DeepSeek</button>
+          <button type="button" class="chip" data-preset="together">Together AI</button>
+          <button type="button" class="chip" data-preset="fireworks">Fireworks</button>
+          <button type="button" class="chip" data-preset="xai">xAI (Grok)</button>
+          <button type="button" class="chip" data-preset="custom">Custom / Other</button>
+        </div>
+        <p class="field-hint" id="preset-note"></p>
+      </div>
+
       <div class="field-group">
         <label class="field-label" for="input-baseurl">API base URL</label>
-        <input id="input-baseurl" class="text-input" type="text" spellcheck="false" autocomplete="off" />
+        <input id="input-baseurl" class="text-input" type="text" spellcheck="false" autocomplete="off" autocapitalize="off" />
       </div>
 
       <div class="field-group">
         <label class="field-label" for="input-model">Model</label>
-        <input id="input-model" class="text-input" type="text" spellcheck="false" autocomplete="off" />
+        <input id="input-model" class="text-input" type="text" spellcheck="false" autocomplete="off" autocapitalize="off" />
       </div>
 
       <div class="field-group">
         <label class="field-label" for="input-apikey">API key</label>
         <div class="key-input-row">
-          <input id="input-apikey" class="text-input" type="password" spellcheck="false" autocomplete="off" placeholder="sk-… / your provider key" />
+          <input id="input-apikey" class="text-input" type="password" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="sk-… / your provider key" />
           <button type="button" id="btn-toggle-key" class="icon-btn" aria-label="Show key">👁</button>
         </div>
         <p class="field-hint">Stored only on this device. Never sent anywhere but the provider you chose.</p>
@@ -62,7 +90,7 @@
       <p class="field-hint setup-note" id="setup-status"></p>
       <details class="cors-note">
         <summary>Getting a network / CORS error?</summary>
-        <p>Some providers block requests sent directly from a browser. Anthropic and OpenRouter both allow it. If your provider blocks it, you'll need a small proxy server in front of it.</p>
+        <p>Some providers block requests sent directly from a browser. Anthropic and Gemini's OpenAI-compatible endpoint both allow it, and OpenRouter and Groq generally do too. If a preset you pick fails immediately with a network/CORS-looking error, that provider likely needs a small proxy server in front of it.</p>
       </details>
     </div>
   </div>
@@ -93,6 +121,8 @@
       <button id="btn-new-character" class="btn-ghost-small">+ New</button>
     </div>
 
+    <p class="field-hint list-hint" id="list-hint">Tap to chat · hold for more options</p>
+
     <div id="character-list" class="character-list">
       <!-- populated by JS -->
     </div>
@@ -108,13 +138,40 @@
 <section id="screen-create" class="screen">
   <header class="topbar">
     <button class="icon-btn" id="btn-create-back" aria-label="Back">←</button>
-    <span class="topbar-title">New character</span>
+    <span class="topbar-title" id="create-title">New character</span>
     <span class="topbar-spacer"></span>
   </header>
 
   <div class="create-content">
     <label class="field-label" for="input-char-desc">Describe them in a sentence or two</label>
-    <textarea id="input-char-desc" class="text-area" rows="4" placeholder="e.g. a retired sea captain who's gruff on the outside but writes poetry no one's ever read"></textarea>
+    <textarea id="input-char-desc" class="text-area" rows="3" placeholder="e.g. a retired sea captain who's gruff on the outside but writes poetry no one's ever read"></textarea>
+
+    <label class="field-label chip-label">Their relationship to you</label>
+    <div class="chip-row" id="relationship-chips">
+      <button type="button" class="chip active" data-rel="Stranger">Stranger</button>
+      <button type="button" class="chip" data-rel="Friend">Friend</button>
+      <button type="button" class="chip" data-rel="Best Friend">Best Friend</button>
+      <button type="button" class="chip" data-rel="Roommate">New Roommate</button>
+      <button type="button" class="chip" data-rel="Sister">Sister</button>
+      <button type="button" class="chip" data-rel="Mother">Mother</button>
+      <button type="button" class="chip" data-rel="__custom">Custom…</button>
+    </div>
+    <input id="input-relationship-custom" class="text-input chip-custom-input" type="text" placeholder="e.g. childhood rival" hidden />
+
+    <label class="field-label chip-label">Personality flavor <span class="chip-label-sub">(pick up to 3, optional)</span></label>
+    <div class="chip-row" id="personality-chips">
+      <button type="button" class="chip" data-trait="Warm">Warm</button>
+      <button type="button" class="chip" data-trait="Sarcastic">Sarcastic</button>
+      <button type="button" class="chip" data-trait="Shy">Shy</button>
+      <button type="button" class="chip" data-trait="Confident">Confident</button>
+      <button type="button" class="chip" data-trait="Playful">Playful</button>
+      <button type="button" class="chip" data-trait="Mysterious">Mysterious</button>
+      <button type="button" class="chip" data-trait="Blunt">Blunt</button>
+      <button type="button" class="chip" data-trait="Nurturing">Nurturing</button>
+      <button type="button" class="chip" data-trait="Chaotic">Chaotic</button>
+      <button type="button" class="chip" data-trait="Calm">Calm</button>
+    </div>
+
     <button id="btn-generate-character" class="btn-primary btn-block">Generate character</button>
 
     <div id="create-loading" class="create-loading" hidden>
@@ -125,10 +182,15 @@
     <div id="character-preview" class="character-preview" hidden>
       <div class="preview-header">
         <div class="char-avatar" id="preview-avatar"></div>
-        <div>
+        <div class="preview-header-text">
           <h3 id="preview-name"></h3>
           <p id="preview-tagline" class="preview-tagline"></p>
         </div>
+      </div>
+      <button id="btn-generate-portrait" class="btn-ghost btn-block">🎨 Generate a portrait</button>
+      <div id="portrait-loading" class="create-loading" hidden>
+        <div class="spinner"></div>
+        <p>Painting a portrait…</p>
       </div>
       <div class="preview-block">
         <h4>Biography</h4>
@@ -160,7 +222,7 @@
       <div class="char-avatar small" id="chat-avatar"></div>
       <div class="chat-identity-text">
         <strong id="chat-char-name">Quick Chat</strong>
-        <span id="chat-char-status">online</span>
+        <span id="chat-char-status"><i class="dot"></i>online</span>
       </div>
     </div>
     <button class="icon-btn" id="btn-chat-menu" aria-label="More">⋮</button>
@@ -174,12 +236,8 @@
 
   <div id="chat-messages" class="chat-messages"></div>
 
-  <div id="typing-indicator" class="typing-indicator" hidden>
-    <span></span><span></span><span></span>
-  </div>
-
   <form id="chat-form" class="chat-input-bar">
-    <textarea id="chat-input" class="chat-textarea" placeholder="Message… try *an action* or `emphasis` or #priority" rows="1"></textarea>
+    <textarea id="chat-input" class="chat-textarea" placeholder="Message… try *an action* or `emphasis` or #priority" rows="1" enterkeyhint="send" inputmode="text" autocapitalize="sentences"></textarea>
     <button type="submit" class="btn-send" id="btn-send" aria-label="Send">➤</button>
   </form>
 </section>
@@ -218,6 +276,15 @@
       <p class="field-hint" id="settings-connection-info"></p>
       <button id="btn-change-key" class="btn-ghost btn-block">Change API key / provider</button>
     </div>
+    <div class="preview-block" id="biometric-row" hidden>
+      <h4>Privacy</h4>
+      <label class="switch-row">
+        <span>Lock app with device biometrics</span>
+        <input type="checkbox" id="toggle-biometric-lock" class="switch-input" />
+        <span class="switch-track"><span class="switch-thumb"></span></span>
+      </label>
+      <p class="field-hint">Uses your phone's fingerprint / face / PIN to gate opening the app. This checks your device only — nothing is sent anywhere.</p>
+    </div>
     <div class="preview-block">
       <h4>Formatting guide</h4>
       <p class="field-hint"><span class="fmt-action">*text*</span> for actions · <span class="fmt-emph">`text`</span> for emphasis · <span class="fmt-priority">#text</span> for high priority</p>
@@ -228,6 +295,24 @@
     </div>
   </div>
 </section>
+
+<!-- ============ BOTTOM SHEET (long-press character actions) ============ -->
+<div id="sheet-overlay" class="sheet-overlay" hidden>
+  <div class="sheet-panel" id="sheet-panel">
+    <div class="sheet-handle"></div>
+    <div class="sheet-header">
+      <div class="char-avatar small" id="sheet-avatar"></div>
+      <strong id="sheet-name"></strong>
+    </div>
+    <button id="sheet-open" class="sheet-btn">💬 Open chat</button>
+    <button id="sheet-rename" class="sheet-btn">✏️ Rename</button>
+    <button id="sheet-portrait" class="sheet-btn">🎨 Generate portrait</button>
+    <button id="sheet-duplicate" class="sheet-btn">📄 Duplicate</button>
+    <button id="sheet-reset" class="sheet-btn">♻️ Reset memory</button>
+    <button id="sheet-delete" class="sheet-btn danger">🗑 Delete character</button>
+    <button id="sheet-cancel" class="sheet-btn cancel">Cancel</button>
+  </div>
+</div>
 
 <script src="app.js"></script>
 </body>

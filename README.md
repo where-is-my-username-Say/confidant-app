@@ -28,11 +28,21 @@ Once it's served over HTTPS, open it on your Android phone in Chrome and use **"
 A real signed `.apk` needs the Android SDK/build tooling, which isn't available in this environment. The practical, honest path that gets you the same result — an icon on the home screen, full-screen standalone window, offline-capable shell — is the installable PWA above. If you specifically want a distributable `.apk` file later, the folder as-is is exactly what a tool like [Bubblewrap](https://github.com/GoogleChromeLabs/bubblewrap) or [PWABuilder](https://www.pwabuilder.com/) needs as input to wrap it into one; you'd host this folder, point either tool at the URL, and it generates the APK for you.
 
 ## Setting up your API key
-On first launch you'll choose a provider and paste in your key:
-- **Anthropic** — works directly from the browser (the app sends the required `anthropic-dangerous-direct-browser-access` header).
-- **OpenAI‑compatible** — works with OpenAI, OpenRouter, Groq, a local Ollama/LM Studio server, etc. Edit the base URL for whichever one you use.
+On first launch (or from Settings → "Change API key / provider") you pick a provider family, then a preset:
 
-Some providers block requests sent directly from a browser (CORS). If yours does, you'll need a tiny reverse-proxy in front of it — the app itself has no server component to do this for you.
+- **Anthropic** — works directly from the browser.
+- **OpenAI‑compatible** — reveals a row of one-tap presets that fill in the base URL and model for you:
+  - **Gemini** — genuinely free tier, no card needed
+  - **OpenAI**
+  - **OpenRouter** — defaults to `openrouter/auto`, which auto-picks a good model per message so it never goes stale; swap in `openrouter/free` or any specific model id if you'd rather pin one
+  - **Groq** — free tier, very fast
+  - **Mistral**, **DeepSeek**, **Together AI**, **Fireworks** — all pay-as-you-go
+  - **xAI (Grok)**
+  - **Custom / Other** — blank fields for anything else, including a local Ollama/LM Studio server
+
+Whichever you pick, the base URL and model stay editable — the preset is just a starting point.
+
+Some providers block requests sent directly from a browser (CORS). Anthropic, Gemini, OpenRouter, and Groq are known to allow it; if a preset fails immediately with what looks like a network error, that provider likely needs a small proxy in front of it.
 
 The key is stored only in the browser's local storage on your device (`localStorage`) and is sent only to the base URL you configured.
 
@@ -49,3 +59,12 @@ All three layers are assembled into the system prompt on every single request �
 - `#text` → high priority / dramatic emphasis
 
 The model is instructed to both use these conventions and interpret them the same way when you use them.
+
+## What's new in this version
+- **Real streaming replies** — text now writes in live, token-by-token, the same way ChatGPT/Claude's own interfaces do (both Anthropic and OpenAI-compatible paths use server-sent events).
+- **Relationship & personality at character creation** — pick how they relate to you (Stranger, Friend, Best Friend, Roommate, Sister, Mother, or a custom relationship) and up to 3 personality flavor tags; both are woven into the generated sheet and kept in the permanent system prompt.
+- **Long-press a character card** for a quick-actions sheet: open, rename, generate a portrait, duplicate, reset memory, or delete.
+- **Best-effort AI portraits** — "Generate a portrait" attempts an image via your provider's `/images/generations` endpoint (works with OpenAI-style image models). Anthropic and providers without an image endpoint fall back gracefully to the colored-initial avatar with a clear message — nothing breaks.
+- **Optional biometric app lock** — if your browser/device supports it, Settings shows a toggle to gate opening the app behind your phone's fingerprint/face/PIN via WebAuthn. This is a local-only device check; there's no server, no account, nothing transmitted.
+- **Mobile keyboard fixes** — the on-screen keyboard now stays open after you hit send, and the layout uses the visible-viewport height so the input bar doesn't get shoved off-screen when the keyboard opens.
+- Chat history was already persisted per character (and for Quick Chat) in local storage — that hasn't changed, it's just more reliable now with the retry/timeout handling.
